@@ -1,0 +1,547 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="UTF-8">
+  <title>Коридоры памяти (3D прототип)</title>
+  <!-- Подключаем Three.js с CDN -->
+  <script src="https://cdn.jsdelivr.net/npm/three@0.151.3/build/three.min.js"></script>
+  <!-- Контроллеры для камеры (WASD/мышь) — упрощённый вариант -->
+  <script src="https://cdn.jsdelivr.net/npm/three@0.151.3/examples/js/controls/PointerLockControls.js"></script>
+  <!-- Дополнительно (по желанию) для пост-обработки, если понадобится -->
+  <script src="https://cdn.jsdelivr.net/npm/three@0.151.3/examples/js/postprocessing/EffectComposer.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/three@0.151.3/examples/js/postprocessing/RenderPass.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/three@0.151.3/examples/js/postprocessing/ShaderPass.js"></script>
+  <!-- Простейший «GlitchPass» для имитации искажений -->
+  <script src="https://cdn.jsdelivr.net/npm/three@0.151.3/examples/js/postprocessing/GlitchPass.js"></script>
+
+  <style>
+    body, html {
+      margin: 0; 
+      padding: 0;
+      overflow: hidden;
+      background: #000; 
+      color: #eee; 
+      font-family: sans-serif;
+    }
+    #ui {
+      position: absolute;
+      top: 10px;
+      left: 10px;
+      z-index: 10;
+    }
+    #ui div {
+      margin-bottom: 5px;
+    }
+    #startOverlay {
+      position: absolute;
+      top: 0; left: 0;
+      width: 100vw; height: 100vh;
+      background: rgba(0,0,0,0.9);
+      display: flex; 
+      flex-direction: column;
+      align-items: center; 
+      justify-content: center;
+      z-index: 999;
+      text-align: center;
+    }
+    #startOverlay button {
+      cursor: pointer;
+      padding: 10px 20px;
+      margin-top: 20px;
+      border: 1px solid #eee;
+      background: #333;
+      color: #eee;
+    }
+    #overlayMessage {
+      position: absolute;
+      top: 40%;
+      left: 50%;
+      transform: translate(-50%, -50%);
+      padding: 1rem;
+      background: rgba(255,255,255,0.1);
+      border: 1px solid #ddd;
+      text-align: center;
+      max-width: 300px;
+      z-index: 998;
+      display: none;
+    }
+    #overlayMessage.show {
+      display: block;
+      animation: fadeInOut 2.5s forwards;
+    }
+    @keyframes fadeInOut {
+      0% {opacity: 0;}
+      10% {opacity: 1;}
+      90% {opacity: 1;}
+      100% {opacity: 0;}
+    }
+  </style>
+</head>
+<body>
+
+<!-- Надписи/кнопки поверх 3D-сцены -->
+<div id="ui">
+  <div id="infoGlitch">Глитч-телепорт: <span id="glitchCount">5</span> / 5</div>
+  <div id="infoFragments">Фрагменты памяти: <span id="fragmentCount">0</span> / 3</div>
+  <div>Управление: WASD + Мышь</div>
+  <div>Нажмите [G] для использования глитч-телепорта</div>
+</div>
+
+<!-- Затемняющий оверлей для старта -->
+<div id="startOverlay">
+  <h1>«Коридоры памяти» (3D)</h1>
+  <p>Вы просыпаетесь в лабиринте собственных воспоминаний.<br/>
+     Найдите выход, собирая фрагменты и используя глитч-телепорт!</p>
+  <button id="startBtn">Начать игру</button>
+</div>
+
+<!-- Всплывающее сообщение (например, при сборе фрагмента) -->
+<div id="overlayMessage"></div>
+
+<script>
+/* 
+  =======================================================================
+    ГЛАВНЫЕ ПЕРЕМЕННЫЕ И НАСТРОЙКИ
+  =======================================================================
+*/
+let scene, camera, renderer;
+let controls; // PointerLockControls
+let clock = new THREE.Clock();
+
+// Для пост-обработки с GlitchPass
+let composer, glitchPass;
+
+// Параметры:
+let glitchCount = 5;       // Сколько раз можно вызвать глитч-телепорт
+let maxGlitchCount = 5;
+let fragmentCount = 0;     // Сколько «фрагментов памяти» собрано
+let totalFragments = 3;
+
+// Флаги, чтобы понимать, когда показать финальный экран и т.д.
+let gameStarted = false;
+let gameEnded = false;
+
+// Размер одной «комнаты/коридора»
+const ROOM_SIZE = 50; 
+
+// Массив «зон/комнат» (упрощённо: расположение в 3D, есть ли там фрагмент, куда ведут «двери»)
+const zones = [
+  // id=0 — стартовая зона
+  {
+    id: 0,
+    position: new THREE.Vector3(0, 0, 0),
+    hasFragment: false,
+    doors: [
+      // объект двери: координата в локальном пространстве зоны, к какой zoneId ведёт
+      { pos: new THREE.Vector3( 25, 0, 0), size: 5, targetZone: 1 },  // дверь справа
+      { pos: new THREE.Vector3(-25, 0, 0), size: 5, targetZone: 2 },  // дверь слева
+      { pos: new THREE.Vector3(0, 0, -25), size: 5, targetZone: 3 }   // дверь прямо
+    ]
+  },
+  // id=1
+  {
+    id: 1,
+    position: new THREE.Vector3(60, 0, 0),
+    hasFragment: true, // фрагмент в этой зоне
+    doors: [
+      { pos: new THREE.Vector3(-25, 0, 0), size: 5, targetZone: 0 },
+      { pos: new THREE.Vector3(25, 0, 0), size: 5, targetZone: 4 } // ведущая дальше
+    ]
+  },
+  // id=2
+  {
+    id: 2,
+    position: new THREE.Vector3(-60, 0, 0),
+    hasFragment: false,
+    doors: [
+      { pos: new THREE.Vector3(25, 0, 0), size: 5, targetZone: 0 },
+      { pos: new THREE.Vector3(0, 0, 25), size: 5, targetZone: 5 }
+    ]
+  },
+  // id=3
+  {
+    id: 3,
+    position: new THREE.Vector3(0, 0, -60),
+    hasFragment: false,
+    doors: [
+      { pos: new THREE.Vector3(0, 0, 25), size: 5, targetZone: 0 },
+      { pos: new THREE.Vector3(25, 0, 0), size: 5, targetZone: 6 }
+    ]
+  },
+  // id=4
+  {
+    id: 4,
+    position: new THREE.Vector3(120, 0, 0),
+    hasFragment: false,
+    doors: [
+      { pos: new THREE.Vector3(-25, 0, 0), size: 5, targetZone: 1 },
+      { pos: new THREE.Vector3(0, 0, -25), size: 5, targetZone: 7 }
+    ]
+  },
+  // id=5
+  {
+    id: 5,
+    position: new THREE.Vector3(-60, 0, 60),
+    hasFragment: true,
+    doors: [
+      { pos: new THREE.Vector3(0, 0, -25), size: 5, targetZone: 2 },
+      { pos: new THREE.Vector3(-25, 0, 0), size: 5, targetZone: 8 }
+    ]
+  },
+  // id=6
+  {
+    id: 6,
+    position: new THREE.Vector3(60, 0, -60),
+    hasFragment: false,
+    doors: [
+      { pos: new THREE.Vector3(-25, 0, 0), size: 5, targetZone: 3 },
+      { pos: new THREE.Vector3(25, 0, 0), size: 5, targetZone: 9 }
+    ]
+  },
+  // id=7 (пустота)
+  {
+    id: 7,
+    position: new THREE.Vector3(120, 0, -60),
+    hasFragment: false,
+    isVoid: true,
+    doors: [
+      { pos: new THREE.Vector3(0, 0, 25), size: 5, targetZone: 4 }
+    ]
+  },
+  // id=8 (зона с фрагментом)
+  {
+    id: 8,
+    position: new THREE.Vector3(-120, 0, 60),
+    hasFragment: true,
+    doors: [
+      { pos: new THREE.Vector3(25, 0, 0), size: 5, targetZone: 5 },
+      { pos: new THREE.Vector3(0, 0, -25), size: 5, targetZone: 10 }
+    ]
+  },
+  // id=9
+  {
+    id: 9,
+    position: new THREE.Vector3(120, 0, -120),
+    hasFragment: false,
+    doors: [
+      { pos: new THREE.Vector3(-25, 0, 0), size: 5, targetZone: 6 }
+    ]
+  },
+  // id=10 (финальный коридор -> выход)
+  {
+    id: 10,
+    position: new THREE.Vector3(-120, 0, 120),
+    hasFragment: false,
+    doors: [
+      { pos: new THREE.Vector3(0, 0, 25), size: 5, targetZone: 8 },
+      // "Финал"
+      { pos: new THREE.Vector3(25, 0, 0), size: 5, targetZone: 999 }
+    ]
+  }
+];
+
+/*
+  =======================================================================
+    ИНИЦИАЛИЗАЦИЯ СЦЕНЫ
+  =======================================================================
+*/
+function init() {
+  scene = new THREE.Scene();
+  scene.background = new THREE.Color(0x000000);
+
+  camera = new THREE.PerspectiveCamera(75, window.innerWidth/window.innerHeight, 0.1, 1000);
+  camera.position.set(0, 2, 5);
+
+  renderer = new THREE.WebGLRenderer({ antialias: true });
+  renderer.setSize(window.innerWidth, window.innerHeight);
+  document.body.appendChild(renderer.domElement);
+
+  // Управление PointerLock (чтобы ходить как в шутерах)
+  controls = new THREE.PointerLockControls(camera, renderer.domElement);
+  scene.add(controls.getObject());
+
+  // Добавим базовое освещение
+  const ambientLight = new THREE.AmbientLight(0xffffff, 0.2);
+  scene.add(ambientLight);
+  const pointLight = new THREE.PointLight(0xffffff, 0.8);
+  pointLight.position.set(0, 10, 0);
+  scene.add(pointLight);
+
+  // Инициализируем зоны (простейшие «комнаты» — просто кубы)
+  createZones();
+
+  // Настраиваем пост-обработку с GlitchPass
+  composer = new THREE.EffectComposer(renderer);
+  const renderPass = new THREE.RenderPass(scene, camera);
+  composer.addPass(renderPass);
+
+  glitchPass = new THREE.GlitchPass();
+  glitchPass.goWild = false; // «Сумасшедший» режим, можно включить при желании
+  glitchPass.enabled = false;
+  composer.addPass(glitchPass);
+
+  // События нажатия клавиш
+  document.addEventListener('keydown', onKeyDown);
+  window.addEventListener('resize', onWindowResize);
+
+  animate();
+}
+
+/*
+  Создаём простейшие «стены» для каждой зоны (куб 50x10x50).
+  Добавляем примитивы для дверей (просто «порталы»).
+*/
+function createZones() {
+  zones.forEach(zone => {
+    // Стены (коробка)
+    const geometry = new THREE.BoxGeometry(ROOM_SIZE, 10, ROOM_SIZE);
+    const material = zone.isVoid 
+      ? new THREE.MeshBasicMaterial({ color: 0xaaaaaa, wireframe: true, transparent: true, opacity: 0.3 })
+      : new THREE.MeshLambertMaterial({ color: 0x222222 });
+    const roomMesh = new THREE.Mesh(geometry, material);
+    roomMesh.position.copy(zone.position);
+    roomMesh.name = "zone_" + zone.id;
+    scene.add(roomMesh);
+
+    // Двери (просто плоские панели другого цвета, чтобы видеть, где «выход»)
+    if (zone.doors) {
+      zone.doors.forEach(door => {
+        const doorGeom = new THREE.PlaneGeometry(door.size, door.size);
+        const doorMat = new THREE.MeshBasicMaterial({ color: 0x4444ff, side: THREE.DoubleSide });
+        const doorMesh = new THREE.Mesh(doorGeom, doorMat);
+        // Позиция двери — относительно зоны
+        doorMesh.position.set(
+          zone.position.x + door.pos.x,
+          zone.position.y + door.pos.y + 1, // чуть выше пола
+          zone.position.z + door.pos.z
+        );
+        // Повернём дверь лицом «наружу» (определяем, если x меняется, вращаем по Y)
+        if (Math.abs(door.pos.x) > 0) {
+          doorMesh.rotation.y = door.pos.x > 0 ? -Math.PI/2 : Math.PI/2;
+        } else if (door.pos.z !== 0) {
+          doorMesh.rotation.y = door.pos.z > 0 ? 0 : Math.PI;
+        }
+
+        // Сохраним в объекте
+        doorMesh.userData = {
+          isDoor: true,
+          targetZone: door.targetZone
+        };
+        scene.add(doorMesh);
+      });
+    }
+
+    // Если есть фрагмент, положим на пол сферу
+    if (zone.hasFragment) {
+      const fragmentGeom = new THREE.SphereGeometry(1, 16, 16);
+      const fragmentMat = new THREE.MeshBasicMaterial({ color: 0xff00ff });
+      const fragmentMesh = new THREE.Mesh(fragmentGeom, fragmentMat);
+      fragmentMesh.position.set(zone.position.x, zone.position.y+1, zone.position.z);
+      fragmentMesh.userData = {
+        isFragment: true,
+        zoneId: zone.id
+      };
+      scene.add(fragmentMesh);
+    }
+  });
+}
+
+/*
+  =======================================================================
+    ГЛАВНЫЙ ЦИКЛ АНІМАЦИИ
+  =======================================================================
+*/
+function animate() {
+  requestAnimationFrame(animate);
+
+  let delta = clock.getDelta();
+
+  // Обновляем управление
+  controls.update(delta);
+
+  // Проверяем столкновения с дверями / сбор фрагментов
+  checkInteractions();
+
+  // Рендерим сцену с учётом пост-обработки
+  composer.render();
+}
+
+/*
+  Обработка столкновений (проще всего — смотрим расстояние от камеры до дверей/фрагментов)
+*/
+function checkInteractions() {
+  // Луч (Raycaster) для проверки «перед носом»
+  let raycaster = new THREE.Raycaster();
+  raycaster.setFromCamera({ x:0, y:0 }, camera);
+
+  const intersects = raycaster.intersectObjects(scene.children, true);
+
+  if (intersects.length > 0) {
+    let dist = intersects[0].distance;
+    let obj = intersects[0].object;
+
+    // Если очень близко к двери
+    if (obj.userData && obj.userData.isDoor && dist < 2) {
+      // Переход в другую зону
+      let target = obj.userData.targetZone;
+      if (target === 999) {
+        // Финал
+        endGame();
+      } else {
+        teleportToZone(target);
+      }
+    }
+
+    // Если близко к фрагменту
+    if (obj.userData && obj.userData.isFragment && dist < 2) {
+      fragmentCount++;
+      updateUI();
+      showMessage("Вы нашли фрагмент воспоминания!");
+
+      // Удалим фрагмент из сцены
+      scene.remove(obj);
+
+      // Помечаем, что зона без фрагмента (собран)
+      let z = zones.find(z => z.id === obj.userData.zoneId);
+      if (z) z.hasFragment = false;
+    }
+  }
+}
+
+/*
+  Переход в другую зону (мы можем «просто» перенести игрока в позицию зоны).
+*/
+function teleportToZone(zoneId) {
+  let zone = zones.find(z => z.id === zoneId);
+  if (!zone) return;
+
+  controls.getObject().position.set(
+    zone.position.x,
+    zone.position.y + 2, // чуть над полом
+    zone.position.z
+  );
+}
+
+/*
+  Глитч-телепорт (по нажатию клавиши G)
+*/
+function doGlitchTeleport() {
+  if (glitchCount <= 0) {
+    showMessage("Ресурс глитча исчерпан!");
+    return;
+  }
+  glitchCount--;
+
+  // Активируем эффект GlitchPass на короткое время
+  glitchPass.enabled = true;
+  setTimeout(() => {
+    glitchPass.enabled = false;
+  }, 500);
+
+  // Случайная зона, кроме финальной
+  let possibleZones = zones.filter(z => z.id !== 999);
+  let randomZone = possibleZones[Math.floor(Math.random() * possibleZones.length)];
+  // Переносим игрока туда
+  teleportToZone(randomZone.id);
+
+  showMessage("Реальность исказилась...");
+
+  // «Стирание» интерфейса после нескольких использований (демо)
+  if (glitchCount === 3) {
+    document.getElementById("fragmentCount").style.display = "none";
+  }
+  if (glitchCount === 1) {
+    document.getElementById("glitchCount").style.display = "none";
+  }
+
+  updateUI();
+}
+
+/*
+  Завершаем игру, если вышли в «финал»
+*/
+function endGame() {
+  if (gameEnded) return;
+  gameEnded = true;
+
+  // Оверлей
+  const overlay = document.getElementById('startOverlay');
+  overlay.style.display = 'flex';
+  overlay.innerHTML = "";
+  
+  let msg = document.createElement('h2');
+  msg.innerText = "Вы выбрались из «Коридоров памяти»!";
+  overlay.appendChild(msg);
+
+  let desc = document.createElement('p');
+  if (fragmentCount >= totalFragments) {
+    desc.innerText = "Вы собрали все осколки воспоминаний и воссоздали свою личность!";
+  } else {
+    desc.innerText = "Кажется, не все воспоминания восстановлены... Но выход уже найден.";
+  }
+  overlay.appendChild(desc);
+
+  let btn = document.createElement('button');
+  btn.innerText = "Начать заново";
+  btn.onclick = () => location.reload();
+  overlay.appendChild(btn);
+}
+
+/*
+  Отображаем краткое всплывающее сообщение
+*/
+function showMessage(text) {
+  let msgBox = document.getElementById("overlayMessage");
+  msgBox.innerText = text;
+  msgBox.classList.add("show");
+  setTimeout(() => {
+    msgBox.classList.remove("show");
+  }, 2500);
+}
+
+/*
+  Событие нажатия клавиш (для PointerLockControls мы не используем стандартные event.key для движения,
+  но нам нужно, например, G для глитча)
+*/
+function onKeyDown(event) {
+  if (!gameStarted) return; // Не реагируем, пока игра не началась
+  if (gameEnded) return;
+
+  if (event.code === "KeyG") {
+    doGlitchTeleport();
+  }
+}
+
+/*
+  Масштабирование при изменении размера окна
+*/
+function onWindowResize() {
+  camera.aspect = window.innerWidth / window.innerHeight;
+  camera.updateProjectionMatrix();
+  renderer.setSize(window.innerWidth, window.innerHeight);
+  composer.setSize(window.innerWidth, window.innerHeight);
+}
+
+/*
+  При старте/нажатии кнопки
+*/
+document.getElementById("startBtn").addEventListener("click", () => {
+  gameStarted = true;
+  document.getElementById("startOverlay").style.display = 'none';
+  controls.lock(); // включаем управление мышью
+});
+
+/*
+  Обновление UI
+*/
+function updateUI() {
+  document.getElementById("glitchCount").innerText = glitchCount;
+  document.getElementById("fragmentCount").innerText = fragmentCount;
+}
+
+// Запуск
+init();
+</script>
+
+</body>
+</html>
